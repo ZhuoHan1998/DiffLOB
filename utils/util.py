@@ -30,15 +30,15 @@ def convert_dataframe_to_tensor(df):
 
     # Extract and sort columns
     ask_price_cols = [f"Ask_Price_{i}" for i in range(10, 0, -1)]
-    ask_size_cols = [f"Ask_Size_{i}" for i in range(10, 0, -1)]
+    ask_size_cols  = [f"Ask_Size_{i}" for i in range(10, 0, -1)]
     bid_price_cols = [f"Bid_Price_{i}" for i in range(1, 11)]
-    bid_size_cols = [f"Bid_Size_{i}" for i in range(1, 11)]
+    bid_size_cols  = [f"Bid_Size_{i}" for i in range(1, 11)]
 
     # Extract data
-    ask_prices = df[ask_price_cols].values  # [N, 10]
-    ask_sizes = df[ask_size_cols].values    # [N, 10]
-    bid_prices = df[bid_price_cols].values  # [N, 10]
-    bid_sizes = df[bid_size_cols].values    # [N, 10]
+    ask_prices = df[ask_price_cols].values   # [N, 10]
+    ask_sizes  = df[ask_size_cols].values    # [N, 10]
+    bid_prices = df[bid_price_cols].values   # [N, 10]
+    bid_sizes  = df[bid_size_cols].values    # [N, 10]
 
     # Stack all levels: [N, 20]
     prices = np.hstack([ask_prices, bid_prices])  # [N, 20]
@@ -52,7 +52,7 @@ def convert_dataframe_to_tensor(df):
 
 def compute_time_deltas(df, time_col = 'Time_dt', total_seconds = 19800):
     """
-    total_seconds: full trading day length (default = 5.5h = 19800 seconds)
+    total_seconds: only keep 10:00AM to 15:30PM data (default = 19800 seconds)
     
     Compute time deltas (in ratio) from opening time.
     Returns a float32 numpy array of shape [N]
@@ -66,13 +66,14 @@ class SlidingWindowDataset(Dataset):
     """
     Constructs a dataset using a sliding window approach. Each sample contains
     'past_window' data and 'predict_window' future data.
-    Also computes the mid-price volatility/trend and liquidity of the predict data.
+    Also computes the mid-price trend/volatility and liquidity/imbalance of the predict data.
     
     Args:
         data_tensor: Tensor of shape [N, 20, 3].
         time_deltas: Array of shape [N], time (in seconds) since market open.
         past_window: The number of past data points.
         predict_window: The number of future data points.
+        step: Sliding window stride.
     """
     def __init__(self, data_tensor, time_deltas, past_window, predict_window, step = 1):
         self.data_tensor = data_tensor
@@ -95,12 +96,13 @@ class SlidingWindowDataset(Dataset):
         # [predict_window, 20, 3]
         future_data = self.data_tensor[start + self.past_window: start + self.past_window + self.predict_window]
         
-        # reshape future_data to [predict_window, 20, 2] by abandoning
-        # ask/bid colume, which is 0/1 sign because it doesn't affect training
+        # reshape past_data and future_data to [predict_window, 20, 2] by abandoning
+        # ask/bid sign colume (0/1), which does not affect training
+        past_data   = past_data[:, :, :2]
         future_data = future_data[:, :, :2]
         
         # Compute the mid-price for last snapshot in past_data.
-        # It is assumed that each Data has shape [20, 3], where:
+        # It is assumed that each data sample has shape [20, 2], where:
         # - The best ask price is located at row 9, column 0,
         # - The best bid price is located at row 10, column 0.
         mid_prices = []
@@ -118,13 +120,14 @@ class SlidingWindowDataset(Dataset):
         
         mid_prices_diff = torch.diff(mid_prices) # Shape: [predict_window]
         
-        # Compute volatility (realized volatility) of the mid-prices
-        # sum(x_t^{2})
-        volatility = torch.square(mid_prices_diff).sum()  # Scalar, representing volatility
-        
         # Compute trend (log return) of the mid-prices
         # sum(x_t)
         trend = mid_prices_diff.sum() # Scalar, representing trend
+        
+        # Compute volatility (realized volatility) of the mid-prices
+        # sum(x_t^{2})
+        # volatility = torch.square(mid_prices_diff).sum()   # Scalar, representing volatility
+        volatility = torch.std(mid_prices_diff)            # Scalar, representing volatility
         
         # Compute liquidity (limit order book depth) by volumes
         liquidity = torch.sum(future_data[:, :, 1], dim = 1) # shape = [predict_window]
@@ -135,17 +138,21 @@ class SlidingWindowDataset(Dataset):
         oi = (ask_liquidity - bid_liquidity) / (ask_liquidity + bid_liquidity)
 
         # Time deltas for past + future
-        time_slice = self.time_deltas[start : start + self.past_window + self.predict_window]  # [T_total]
-        time_deltas = torch.tensor(time_slice, dtype = torch.float32)
+        past_time_slice = self.time_deltas[start : start + self.past_window]  # [self.past_window]
+        past_time_deltas = torch.tensor(past_time_slice, dtype = torch.float32)
         
-        # past_data shape: [past_window, 20, 3]
+        future_time_slice = self.time_deltas[start + self.past_window: start + self.past_window + self.predict_window]  # [self.predict_window]
+        future_time_deltas = torch.tensor(future_time_slice, dtype = torch.float32)
+        
+        # past_data shape: [past_window, 20, 2]
         # predict_data shape: [predict_window, 20, 2]
-        # volatility: scalar
         # trend: scalar
+        # volatility: scalar
         # liquidity shape: [predict_window]
         # oi shape: [predict_window]
-        # time_deltas: [past_window + predict_window]
-        return past_data, future_data, volatility, trend, liquidity, oi, time_deltas
+        # past_time_deltas: [past_window + predict_window]
+        # future_time_deltas: [predict_window]
+        return past_data, future_data, trend, volatility, liquidity, oi, past_time_deltas, future_time_deltas
 
 
 def get_dataloader(data_tensor, time_deltas, past_window, predict_window, batch_size, step = 1, shuffle = True):
@@ -153,15 +160,12 @@ def get_dataloader(data_tensor, time_deltas, past_window, predict_window, batch_
     Creates a DataLoader for the sliding window dataset.
     
     The custom collate function returns:
-      - past_batch: a list of lists, each containing past_window PyG Data objects.
-      - predict_batch: a tensor of shape [batch_size, predict_window, 20, 2],
-                       representing the future data.
-      - volatility_batch: a tensor of shape [batch_size], the volatility values.
+      - past_batch: a tensor of shape [batch_size, predict_window, 20, 2], the past data.
+      - predict_batch: a tensor of shape [batch_size, predict_window, 20, 2], the future data.
       - trend_batch: a tensor of shape [batch_size], the trend values.
-      - liquidity_batch: a tensor of shape [batch_size, predict_window, 1],
-                         representing the order book liquidity.
-      - oi_batch: a tensor of shape [batch_size, predict_window, 1],
-                         representing the order book imbalance.
+      - volatility_batch: a tensor of shape [batch_size], the volatility values.
+      - liquidity_batch: a tensor of shape [batch_size, predict_window], the order book liquidity.
+      - oi_batch: a tensor of shape [batch_size, predict_window], the order book imbalance.
     
     Args:
         past_window: Number of past data points.
@@ -175,114 +179,117 @@ def get_dataloader(data_tensor, time_deltas, past_window, predict_window, batch_
     def collate_fn(batch):
         # Each batch element is a tuple:
         # (past_data, predict_data, volatility, trend, liquidity, past_time, predict_time)
-        past_batch = torch.stack([item[0] for item in batch], dim = 0)         # [batch_size, past_window, 20, 3]
+        past_batch = torch.stack([item[0] for item in batch], dim = 0)         # [batch_size, past_window, 20, 2]
         predict_batch = torch.stack([item[1] for item in batch], dim = 0)      # [batch_size, predict_window, 20, 2]
-        volatility_batch = torch.stack([item[2] for item in batch])            # [batch_size]
-        trend_batch = torch.stack([item[3] for item in batch])                 # [batch_size]
+        trend_batch = torch.stack([item[2] for item in batch])                 # [batch_size]
+        volatility_batch = torch.stack([item[3] for item in batch])            # [batch_size]
         liquidity_batch = torch.stack([item[4] for item in batch], dim = 0)    # [batch_size, predict_window]
         oi_batch = torch.stack([item[5] for item in batch], dim = 0)           # [batch_size, predict_window]
-        past_time_batch = torch.stack([item[6] for item in batch], dim = 0)[:, :past_window]    # [batch_size, past_window]
-        predict_time_batch = torch.stack([item[6] for item in batch], dim = 0)[:, past_window:] # [batch_size, predict_window] 
+        past_time_batch = torch.stack([item[6] for item in batch], dim = 0)    # [batch_size, past_window]
+        predict_time_batch = torch.stack([item[7] for item in batch], dim = 0) # [batch_size, predict_window] 
         
-        return past_batch, predict_batch, volatility_batch, trend_batch, liquidity_batch, oi_batch, past_time_batch, predict_time_batch
+        return past_batch, predict_batch, trend_batch, volatility_batch, liquidity_batch, oi_batch, past_time_batch, predict_time_batch
     
     dataloader = DataLoader(dataset, batch_size = batch_size, shuffle = shuffle, 
                             collate_fn = collate_fn, drop_last = True)
     return dataloader
 
 
-def transform_predict_batch(past_batch, predict_batch):
+def transform_past_predict_batch(past_batch, predict_batch):
     """
-    Transform predict_batch to:
+    Transform past_batch and predict_batch to:
       1) temporal mid-price returns
       2) cross-sectional price level returns
       3) original volume levels (unchanged)
       
     Args:
-        past_batch: Tensor of shape [B, past_window, 20, 3]
+        past_batch: Tensor of shape [B, past_window, 20, 2]
         predict_batch: Tensor of shape [B, predict_window, 20, 2]
     
     Returns:
-        Tensor of shape [B, predict_window, 20, 2]
+        Two tensors of shape [B, predict_window, 20, 2]
     """
-    batch_size, predict_window, num_levels, _ = predict_batch.shape
-    outputs = []
+    batch_size, past_window, num_levels, _ = past_batch.shape
+    _, predict_window, _, _                = predict_batch.shape
+    assert past_window == predict_window + 1, "past_window must be predict_window + 1"
+
+    # compute mid-prices over future window
+    past_mid = (past_batch[:, :, 9, 0] + past_batch[:, :, 10, 0]) / 2.0         # [B, past_window]
+    future_mid = (predict_batch[:, :, 9, 0] + predict_batch[:, :, 10, 0]) / 2.0 # [B, predict_window]
+
+    # temporal mid-price diffs for past: [B, past_window - 1]
+    mid_diffs_past = past_mid[:, 1:] - past_mid[:, :-1]                         # diff return
+    # mid_diffs_past = past_mid[:, 1:] / past_mid[:, :-1] - 1                   # pct return
+    # mid_diffs_past = torch.log(past_mid[:, 1:]) - torch.log(past_mid[:, :-1]) # log return
     
-    for i in range(batch_size):
-        # last snapshot from past_batch: [num_levels, 3]
-        last_snapshot = past_batch[i, -1]                            # [num_levels, 3]
-        mid_last = (last_snapshot[9, 0] + last_snapshot[10, 0]) / 2  # scalar
-        
-        future = predict_batch[i]    # [predict_window, num_levels, 2]
+    # temporal mid-price diffs for future: [B, predict_window]
+    last_past_mid = past_mid[:, -1:].clone()          # [B, 1]
+    mid_seq_future = torch.cat([last_past_mid, future_mid], dim = -1)
+    mid_diffs_future = mid_seq_future[:, 1:] - mid_seq_future[:, :-1]                         # diff return
+    # mid_diffs_future = mid_seq_future[:, 1:] / mid_seq_future[:, :-1] - 1                   # pct return
+    # mid_diffs_future = torch.log(mid_seq_future[:, 1:]) - torch.log(mid_seq_future[:, :-1]) # log return
 
-        # compute mid-prices over future window
-        mids = [mid_last]
-        for snap in future:
-            mids.append((snap[9,0] + snap[10,0]) / 2)
-        mids = torch.stack(mids)   # [predict_window+1]
+    # cross-sectional price-level diffs for past: [B, past_window - 1, num_levels - 1]
+    past_prices = past_batch[..., 0]      # [past_window - 1, num_levels]
+    past_price_diff = past_prices[:, 1:, :-1] - past_prices[:, 1:, 1:]
+    
+    # cross-sectional price-level diffs for future: [B, predict_window, num_levels - 1]
+    future_prices = predict_batch[..., 0] # [predict_window, num_levels]
+    future_price_diff = future_prices[:, :, :-1] - future_prices[:, :, 1:]
 
-        # temporal mid-price diffs: [predict_window]
-        mid_diffs = torch.diff(mids)   # [predict_window]
-        # mid_diffs = mids[1:] / mids[:-1] - 1  # [predict_window] # change differences to pct returns
-        # mid_diffs = torch.diff(torch.log(mids)) # [predict_window] # change differences to log returns
-
-        # cross-sectional price-level diffs: [predict_window, num_levels-1]
-        prices = future[..., 0]     # [predict_window, num_levels]
-        price_diff = prices[:, :-1] - prices[:, 1:]     # [predict_window, num_levels-1]
-
-        # build a tensor for the price-derived feature: shape [predict_window, num_levels, 1]
-        price_feat = torch.empty(predict_window, num_levels, 1, device = future.device)
-        # place mid_diff in slot [:, 0, 0]
-        price_feat[:, 0, 0] = mid_diffs
-        # place cross-sectional diffs in slots [:, 1:, 0]
-        price_feat[:, 1:, 0] = price_diff
-        
-        # original volumes: [predict_window, num_levels]
-        volumes = future[..., 1]   # [predict_window, num_levels]
-
-        # build volume feature: [predict_window, num_levels, 1]
-        volume_feat = volumes.unsqueeze(-1)
-
-        # concatenate along last dimension to get [..., 2]
-        transformed = torch.cat((price_feat, volume_feat), dim = 2)  # [predict_window, num_levels, 2]
-        outputs.append(transformed)
-
-    return torch.stack(outputs, dim = 0)  # [batch_size, predict_window, num_levels, 2]
-
+    # build a tensor for the price-derived feature
+    price_feat_past   = torch.empty(batch_size, past_window - 1, num_levels, 1)
+    price_feat_future = torch.empty(batch_size, predict_window, num_levels, 1)
+    
+    price_feat_past[:, :, 0, 0]   = mid_diffs_past
+    price_feat_future[:, :, 0, 0] = mid_diffs_future
+    
+    price_feat_past[:, :, 1:, 0]   = past_price_diff
+    price_feat_future[:, :, 1:, 0] = future_price_diff
+    
+    volume_feat_past = past_batch[:, 1:, :, -1:]     # [B, past_window - 1, num_levels, 1]
+    volume_feat_future = predict_batch[:, :, :, -1:] # [B, past_window - 1, num_levels, 1]
+    
+    past_transformed   = torch.cat([price_feat_past, volume_feat_past], dim = -1)
+    future_transformed = torch.cat([price_feat_future, volume_feat_future], dim = -1)
+    
+    # past_transformed: [B, past_window - 1, num_levels, 2]
+    # predict_transformed: [B, predict_window, num_levels, 2]
+    return past_transformed, future_transformed
 
 def transform_sample_batch(past_batch, samples):
     """
     transform generated samples (temporal mid-price differences, cross-section price level differences) 
     to absolute price
     
-    past_batch: Tensor of shape [batch_size, past_window, 20, 3]
-    samples: Tensor of shape [batch_size, 1, 20, predict_window]
+    past_batch: Tensor of shape [B, past_window, 20, 2]
+    samples: Tensor of shape [B, 1, 20, predict_window]
 
     Returns:
-        future_prices: Tensor of shape [batch_size, 20, predict_window, 1]    
+        future_prices: Tensor of shape [B, predict_window, 20, 1]
     """
     
     device = samples.device
     sample_batch_size, _, _, predict_window = samples.shape
 
-    # Last snapshot from past: [sample_batch_size, 20, 3]
-    last_initial_data = past_batch[:, -1, :, :].to(device)
+    # Last snapshot from past: [B, 20, 2]
+    last_past_data = past_batch[:, -1, :, :].to(device)
 
-    # compute last mid price in batch, last_mid_price shape = [batch_size]             
-    last_mid_price = ((last_initial_data[:, 9, 0] + last_initial_data[:, 10, 0]) / 2)
+    # compute last mid price in batch, last_mid_price shape = [B]             
+    last_mid_price = ((last_past_data[:, 9, 0] + last_past_data[:, 10, 0]) / 2)
 
     # compute price level in batch
-    diff_mid = samples[:, 0, 0, :]              # [batch_size, predict_window]
-    diff_price_levels = samples[:, 0, 1:, :]    # [batch_size, predict_window, 19]
+    diff_mid = samples[:, 0, 0, :]              # [B, predict_window]
+    diff_price_levels = samples[:, 0, 1:, :]    # [B, predict_window, 19]
     
     future_mid = last_mid_price + torch.cumsum(diff_mid, dim = 1)
-    # future_mid = last_mid_price * torch.cumprod((1+diff_mid), dim = 1) # change differences to returns
+    # future_mid = last_mid_price * torch.cumprod((1+diff_mid), dim = 1)
     # future_mid = last_mid_price * torch.exp(torch.cumsum(diff_mid, dim = 1))
     
     future_prices = []
     for t in range(predict_window):
-        mid_t = future_mid[:, t]                 # [batch_size]
-        d = diff_price_levels[:, :, 19]          # [batch_size, 19], all positive values
+        mid_t = future_mid[:, t]                 # [B]
+        d = diff_price_levels[:, :, 19]          # [B, 19], all positive values
         # p shape = [batch_size, 20]
         p = torch.empty(sample_batch_size, 20, device = device, dtype = last_mid_price.dtype)
 
@@ -300,8 +307,8 @@ def transform_sample_batch(past_batch, samples):
 
         future_prices.append(p.unsqueeze(1))
 
-    # future_prices shape = [batch_size, 1, 20, predict_window]
-    future_prices = torch.cat(future_prices, dim = 1).unsqueeze(-1).permute(0, 3, 2, 1)
+    # future_prices shape = [B, predict_window, 1, 20]
+    future_prices = torch.cat(future_prices, dim = 1).unsqueeze(-1)
     
     return future_prices
     
@@ -448,7 +455,6 @@ def get_score_fn(sde, model, continuous = False):
 def to_flattened_numpy(x):
     """Flatten a torch tensor `x` and convert it to numpy."""
     return x.detach().cpu().numpy().reshape((-1,))
-
 
 def from_flattened_numpy(x, shape):
     """Form a torch tensor with the given `shape` from a flattened numpy array `x`."""

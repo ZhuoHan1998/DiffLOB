@@ -3,7 +3,7 @@ import torch.nn as nn
 from torch.optim import Adam
 import tqdm
 
-from utils.util import ExponentialMovingAverage, transform_predict_batch, nse_transform
+from utils.util import ExponentialMovingAverage, transform_past_predict_batch, nse_transform
 from utils.sde_lib import VESDE, VPSDE, subVPSDE
 from utils.losses import get_loss_fn
 
@@ -47,73 +47,53 @@ class Trainer():
                                    likelihood_weighting = self.likelihood_weighting)
         
         
-    def _process_batch(self, past_batch, predict_batch, volatility_batch, trend_batch, liquidity_batch, oi_batch, past_time_batch, predict_time_batch):
+    def _process_batch(self, past_batch, predict_batch, trend_batch, volatility_batch, liquidity_batch, oi_batch, past_time_batch, predict_time_batch):
         
-        transformed_predict_batch = transform_predict_batch(past_batch, predict_batch) # [B, predict_window, 20, 2]
+        # both shape is [B, predict_window, 20, 2] if 'past_window - 1 == predict_window'
+        transformed_past_batch, transformed_predict_batch = transform_past_predict_batch(past_batch, predict_batch) 
 
         # Build target tensor x of shape [B, 2, 20, predict_window]
-        
+
         # price process
-        x_price = transformed_predict_batch[:, :, :, 0] # [B, predict_window, 20]
-        # x_price = x_price * 1e2
-        
-        # Norm-salvaged Embedding for return series
-#         for i in range(x_price.shape[0]):
-#             original_series = x_price[i, :, 0]
-#             transformed_series = nse_transform(original_series)
-#             x_price[i, :, 0] = transformed_series
-            
-#         x_price[:, 0, 0] = x_price[:, 0, 0]
-#         x_price[:, 1, 0] = x_price[:, 1, 0]
-#         x_price[:, :, 1:] = x_price[:, :, 1:]
+        x_price = transformed_predict_batch[:, :, :, 0:1] # [B, predict_window, 20, 1]
+        x_price = x_price * 100
         
         # volume process
-        x_volume = predict_batch[:, :, :, 1]
-        x_volume = torch.sqrt(x_volume) / 15
-        
-        x_price = x_price.unsqueeze(1).permute(0, 1, 3, 2)
-        x_volume = x_volume.unsqueeze(1).permute(0, 1, 3, 2)
+        x_volume = transformed_predict_batch[:, :, :, -1:]
+        x_volume = torch.sqrt(x_volume) / 15 # [B, predict_window, 20, 1]
         
         # concat price and volume
-        x = torch.cat([x_price, x_volume], dim = 1)       
+        x = torch.concat([x_price, x_volume], dim = -1).permute(0, 3, 2, 1)       
         x = x.to(self.device)
         
         # Select condition
         # Build each condition tensor of shape [B, 1, 20, predict_window]
         
-        past_price_cond = past_batch[:, :, :, 0].permute(0, 2, 1).unsqueeze(1) 
-        past_price_cond = past_price_cond / 100
+        past_price_cond = transformed_past_batch[:, :, :, 0:1].permute(0, 3, 2, 1)
+        past_price_cond = past_price_cond * 100
 
-        past_volume_cond = past_batch[:, :, :, 1].permute(0, 2, 1).unsqueeze(1)
+        past_volume_cond = transformed_past_batch[:, :, :, -1:].permute(0, 3, 2, 1)
         past_volume_cond = torch.sqrt(past_volume_cond) / 15
         
-        volatility_cond = volatility_batch.unsqueeze(1).unsqueeze(2).unsqueeze(3).expand(-1, 1, self.predict_window, 20).permute(0, 1, 3, 2)
-        # volatility_cond = torch.clamp(volatility_cond, max = 0.01)
-        # volatility_cond = volatility_cond * 1e1
-        
-        trend_cond = trend_batch.unsqueeze(1).unsqueeze(2).unsqueeze(3).expand(-1, 1, self.predict_window, 20).permute(0, 1, 3, 2)
+        trend_cond = trend_batch.unsqueeze(1).unsqueeze(2).unsqueeze(3).expand(-1, 1, 20, self.predict_window)
         # trend_cond = torch.clamp(trend_cond, min = -0.1, max = 0.1)
-        # trend_cond = trend_cond * 1e1
+        trend_cond = torch.where(trend_cond >= 0, torch.sqrt(trend_cond), -torch.sqrt(-trend_cond))
+        
+        volatility_cond = volatility_batch.unsqueeze(1).unsqueeze(2).unsqueeze(3).expand(-1, 1, 20, self.predict_window)
+        # volatility_cond = torch.clamp(volatility_cond, max = 0.01)
+        volatility_cond = torch.sqrt(volatility_cond)
         
         liquidity_cond = liquidity_batch / 20
-        liquidity_cond = liquidity_cond.unsqueeze(1).unsqueeze(-1).expand(-1, 1, self.config.predict_window, 20).permute(0, 1, 3, 2)
+        liquidity_cond = liquidity_cond.unsqueeze(1).unsqueeze(2).expand(-1, 1, 20, self.predict_window)
         liquidity_cond = torch.sqrt(liquidity_cond) / 15
         
-        oi_cond = oi_batch.unsqueeze(1).unsqueeze(-1).expand(-1, 1, self.config.predict_window, 20).permute(0, 1, 3, 2)
+        oi_cond = oi_batch.unsqueeze(1).unsqueeze(2).expand(-1, 1, 20, self.predict_window)
 
-        time_cond = predict_time_batch.unsqueeze(1).unsqueeze(-1).expand(-1, 1, self.config.predict_window, 20).permute(0, 1, 3, 2)
-
-        # add past mid price info into condition
-        past_mid_cond = (past_price_cond[:, :, 9, :] + past_price_cond[:, :, 10, :]) / 2 # [B, 1, past_window]
-        past_mid_cond = past_mid_cond.unsqueeze(2).expand(-1, -1, 20, -1) # [B, 1, 20, past_window]
-
-        # add past mid price difference info into condition
-        past_mid_diff_cond = torch.diff(past_mid_cond, dim = -1, prepend = past_mid_cond[..., :1]) # [B, 1, 20, past_window]
-        # past_mid_diff_cond = past_mid_diff_cond * 1e2
+        time_cond = predict_time_batch.unsqueeze(1).unsqueeze(2).expand(-1, 1, 20, self.predict_window)
 
         # concat all contions
-        assert (past_price_cond.shape[1] == past_volume_cond.shape[1]  == volatility_cond.shape[1] == trend_cond.shape[1] == liquidity_cond.shape[1] == oi_cond.shape[1] == time_cond.shape[1] == past_mid_cond.shape[1] == past_mid_diff_cond.shape[1]), "Past condition length does not match prediction length."
-        cond = torch.cat([past_price_cond, past_volume_cond, volatility_cond, trend_cond, liquidity_cond, oi_cond, time_cond, past_mid_cond, past_mid_diff_cond],  dim = 1)
+        assert (past_price_cond.shape[1] == past_volume_cond.shape[1] == trend_cond.shape[1] == volatility_cond.shape[1] == liquidity_cond.shape[1] == oi_cond.shape[1] == time_cond.shape[1]), "Past condition length does not match prediction length."
+        cond = torch.cat([past_price_cond, past_volume_cond, trend_cond, volatility_cond, liquidity_cond, oi_cond, time_cond], dim = 1)
 
         cond = cond.to(self.device)
         
@@ -122,7 +102,7 @@ class Trainer():
             cond = torch.zeros_like(cond)
         
         # x.shape = [batch_size, 2, 20, predict_window]
-        # cond.shape = [batch_size, 9, 20, predict_window]
+        # cond.shape = [batch_size, 7, 20, predict_window]
         return x, cond
     
 
@@ -136,8 +116,8 @@ class Trainer():
         total_loss = 0.0
         total_items = 0
 
-        for past_batch, predict_batch, volatility_batch, trend_batch, liquidity_batch, oi_batch, past_time_batch, predict_time_batch in dataloader:
-            x, cond = self._process_batch(past_batch, predict_batch, volatility_batch, trend_batch, liquidity_batch, oi_batch, past_time_batch, predict_time_batch)
+        for past_batch, predict_batch, trend_batch, volatility_batch, liquidity_batch, oi_batch, past_time_batch, predict_time_batch in dataloader:
+            x, cond = self._process_batch(past_batch, predict_batch, trend_batch, volatility_batch, liquidity_batch, oi_batch, past_time_batch, predict_time_batch)
 
             if training:
                 self.optimizer.zero_grad()
@@ -166,10 +146,10 @@ class Trainer():
         # Initialize model
         if self.diff_model == "csdi":
             from nets.diff_csdi import diff_CSDI
-            self.diff_net = diff_CSDI(inputdim = 2, side_dim = 9)
+            self.diff_net = diff_CSDI(inputdim = 2, side_dim = 7)
         if self.diff_model == "s4":
             from nets.diff_s4 import diff_S4
-            self.diff_net = diff_S4(input_dim = 2, cond_dim = 9)
+            self.diff_net = diff_S4(input_dim = 2, cond_dim = 7)
         if self.diff_model == "transformer":
             from nets.transformer import TransformerDiffusionModel
             self.diff_net = TransformerDiffusionModel()
@@ -178,7 +158,7 @@ class Trainer():
             self.diff_net = CNNDiffusionModel()
         if self.diff_model == "wavenet":
             from nets.diff_wavenet_joint import WaveNetJoint
-            self.diff_net = WaveNetJoint(input_dim = 2, cond_dim = 9)
+            self.diff_net = WaveNetJoint(input_dim = 2, cond_dim = 7)
 
         self.diff_net.to(self.device)
 
@@ -207,7 +187,7 @@ class Trainer():
                 early_stop_counter += 1
 
             if early_stop_counter >= self.early_stop_patience:
-                print(f"Early stopping triggered at epoch {epoch}.")
+                print(f"Early stopping triggered at epoch {epoch}, best loss is {best_loss}.")
                 break
 
 

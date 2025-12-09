@@ -80,21 +80,26 @@ class CondFiLM(nn.Module):
 
     
 class GatedWaveNetBlock(nn.Module):
-    def __init__(self, channels, cond_channels, dilation):
+    def __init__(self, channels, dilation):
         super().__init__()
+        self.norm = nn.GroupNorm(num_groups = 8, num_channels = channels, eps = 1e-5)
         self.filter_conv = nn.Conv2d(channels, channels, kernel_size = (3, 3),
                                      padding = (dilation, dilation), dilation = (dilation, dilation))
         self.gate_conv   = nn.Conv2d(channels, channels, kernel_size = (3, 3),
                                      padding = (dilation, dilation), dilation = (dilation, dilation))
         self.time_film   = TimeFiLM(emb_dim = 128, n_channels = channels)
-        self.cond_film   = CondFiLM(cond_channels = cond_channels, n_channels = channels)
-        self.cond_proj   = nn.Conv2d(cond_channels, channels, kernel_size = 1)
+        self.cond_film   = CondFiLM(cond_channels = channels, n_channels = channels)
+        self.cond_proj   = nn.Conv2d(channels, channels, kernel_size = 1)
 
         self.residual_proj = nn.Conv2d(channels, channels, kernel_size = 1)
         self.skip_proj     = nn.Conv2d(channels, channels, kernel_size = 1)
 
     def forward(self, x, cond, t_emb):
         B, C, F, T = x.shape
+        
+        residual_input = x
+        
+        x = self.norm(x)
 
         x = self.time_film(x, t_emb)  # [B, base_channels, F, T]
         
@@ -108,7 +113,7 @@ class GatedWaveNetBlock(nn.Module):
         residual = self.residual_proj(h)  # [B,base_channels,F,T] 
         skip     = self.skip_proj(h)      # [B,base_channels,F,T] 
 
-        x = x + residual
+        x = residual_input + residual
         return x, skip
 
 class FeatureAttention(nn.Module):
@@ -118,6 +123,7 @@ class FeatureAttention(nn.Module):
                                           dropout = dropout, batch_first = True)
 
     def forward(self, x):
+        # we should change feature attention, to make it aware of time dimension
         B, C, F, T = x.shape
         # reshape to (B * T, F, C)
         x_t = x.permute(0, 3, 2, 1).reshape(B * T, F, C)
@@ -131,6 +137,10 @@ class FeatureProjector(nn.Module):
     def __init__(self, in_channels, out_channels, num_groups = 8):
         super().__init__()
         self.proj = nn.Conv2d(in_channels, out_channels, kernel_size = 1)
+        # using uniform weight and bias
+        nn.init.xavier_uniform_(self.proj.weight)
+        nn.init.zeros_(self.proj.bias)
+        
         # GroupNorm can force normalization
         self.norm = nn.GroupNorm(num_groups, out_channels)
         self.act = nn.SiLU()
@@ -186,7 +196,7 @@ class WaveNetJoint(nn.Module):
         base_cycle = [1, 2, 4, 8, 16]  
         dilations = [base_cycle[i % len(base_cycle)] for i in range(num_layers)]
         for d in dilations:
-            self.blocks.append(GatedWaveNetBlock(base_channels, base_channels, dilation = d))
+            self.blocks.append(GatedWaveNetBlock(base_channels, dilation = d))
 
         self.output_proj = nn.Sequential(
             nn.ReLU(),
@@ -225,6 +235,4 @@ class WaveNetJoint(nn.Module):
         out = self.output_proj(skip_total)
         
         return out # torch.Size([64, 2, 20, 32])
-
-
 
