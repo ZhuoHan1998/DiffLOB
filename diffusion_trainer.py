@@ -3,7 +3,7 @@ import torch.nn as nn
 from torch.optim import Adam
 import tqdm
 
-from utils.util import ExponentialMovingAverage, transform_past_predict_batch, nse_transform
+from utils.util import transform_past_predict_batch, nse_transform
 from utils.sde_lib import VESDE, VPSDE, subVPSDE
 from utils.losses import get_loss_fn
 
@@ -106,34 +106,40 @@ class Trainer():
         return x, cond
     
 
-    def _run_epoch(self, dataloader, training: bool):
+    def _run_epoch(self, dataloader, training: bool, enable_motion: bool, enable_control:bool):
         net = self.diff_net
         if training:
-            net.train()
+            net.train()      
         else:
             net.eval()
 
         total_loss = 0.0
         total_items = 0
+        scaler = torch.amp.GradScaler()
 
         for past_batch, predict_batch, trend_batch, volatility_batch, liquidity_batch, oi_batch, past_time_batch, predict_time_batch in dataloader:
             x, cond = self._process_batch(past_batch, predict_batch, trend_batch, volatility_batch, liquidity_batch, oi_batch, past_time_batch, predict_time_batch)
 
-            if training:
+            if training:    
                 self.optimizer.zero_grad()
-                loss = self.loss_fn(net, x, cond)
+                with torch.amp.autocast(device_type = self.device):
+                    loss = self.loss_fn(net, x, cond, enable_motion, enable_control)
+                    
                 # skip batch that would elicit nan loss
                 if torch.isnan(loss) or torch.isinf(loss):
                     continue
-                loss.backward()
+                    
+                scaler.scale(loss).backward()
+                
                 if self.clip_gradient is not None:
                     nn.utils.clip_grad_norm_(net.parameters(), self.clip_gradient)
-                self.optimizer.step()
-                if self.ema_rate is not None:
-                    self.diff_ema.update(net.parameters())
+                
+                scaler.step(self.optimizer)
+                scaler.update()
+            
             else:
                 with torch.no_grad():
-                    loss = self.loss_fn(net, x, cond)
+                    loss = self.loss_fn(net, x, cond, enable_motion, enable_control)
 
             batch_size = x.shape[0]
             total_loss += loss.item() * batch_size
@@ -150,48 +156,96 @@ class Trainer():
         if self.diff_model == "s4":
             from nets.diff_s4 import diff_S4
             self.diff_net = diff_S4(input_dim = 2, cond_dim = 7)
-        if self.diff_model == "transformer":
-            from nets.transformer import TransformerDiffusionModel
-            self.diff_net = TransformerDiffusionModel()
-        if self.diff_model == "unet":
-            from nets.unet import CNNDiffusionModel
-            self.diff_net = CNNDiffusionModel()
         if self.diff_model == "wavenet":
-            from nets.diff_wavenet_joint import WaveNetJoint
+            from nets.diff_wavenet import WaveNetJoint
             self.diff_net = WaveNetJoint(input_dim = 2, cond_dim = 7)
-
+        if self.diff_model == "wavenet_motion":
+            from nets.diff_wavenet_motion import WaveNetJoint
+            self.diff_net = WaveNetJoint(input_dim = 2, cond_dim = 7)
+        if self.diff_model == "wavenet_control":
+            from nets.diff_wavenet_control import WaveNetJoint
+            self.diff_net = WaveNetJoint(input_dim = 2, cond_dim = 7)
+        if self.diff_model == "wavenet_motion_control":
+            from nets.diff_wavenet_motion_control import WaveNetJoint
+            self.diff_net = WaveNetJoint(input_dim = 2, cond_dim = 7)
+        
         self.diff_net.to(self.device)
-
-        # EMA & optimizer
-        self.diff_ema = ExponentialMovingAverage(self.diff_net.parameters(), self.ema_rate)
-        self.optimizer = Adam(self.diff_net.parameters(), lr = self.learning_rate, weight_decay = self.weight_decay)
-
-        best_loss = float('inf')
-        early_stop_counter = 0
-        loop = tqdm.trange(self.n_epochs)
-
-        for epoch in loop:
-            train_loss = self._run_epoch(self.train_dataloader, training = True)
-            val_loss = self._run_epoch(self.val_dataloader, training = False)
-
-            loop.set_description(f"Epoch {epoch} | Train Loss: {train_loss:.5f} | Val Loss: {val_loss:.5f}")
-
-            # Early stopping based on validation loss
-            if best_loss - val_loss > self.early_stop_min_delta:
-                best_loss = val_loss
-                early_stop_counter = 0
-                # save the model only when val loss decreases
-                torch.save(self.diff_net.state_dict(), self.diff_model_saving_path)
-                
+        net = self.diff_net
+                    
+        def each_layer_train_val(enable_motion, enable_control):
+            # determine which parameters should be freezed
+            if enable_motion == True and enable_control == False:
+                for name, param in net.named_parameters():
+                    if "motion_module" not in name:
+                        param.requires_grad = False
+            elif enable_motion == False and enable_control == True:
+                for name, param in net.named_parameters():
+                    if "control_blocks" not in name:
+                        param.requires_grad = False
+            elif enable_motion == True and enable_control == True:
+                for name, param in net.named_parameters():
+                    if "control_blocks" not in name:
+                        param.requires_grad = False  
             else:
-                early_stop_counter += 1
+                for param in net.parameters():
+                    param.requires_grad = True 
+        
+            best_loss = float('inf')
+            early_stop_counter = 0
+            loop = tqdm.trange(self.n_epochs)
+            self.optimizer = Adam(filter(lambda p: p.requires_grad, net.parameters()), 
+                                  lr = self.learning_rate, weight_decay = self.weight_decay) 
 
-            if early_stop_counter >= self.early_stop_patience:
-                print(f"Early stopping triggered at epoch {epoch}, best loss is {best_loss}.")
-                break
+            for epoch in loop:
+                train_loss = self._run_epoch(self.train_dataloader, training = True, enable_motion = enable_motion, enable_control = enable_control)
+                val_loss = self._run_epoch(self.val_dataloader, training = False, enable_motion = enable_motion, enable_control = enable_control)
 
+                loop.set_description(f"Epoch {epoch} | Train Loss: {train_loss:.5f} | Val Loss: {val_loss:.5f}")
 
+                # Early stopping based on validation loss
+                if best_loss - val_loss > self.early_stop_min_delta:
+                    best_loss = val_loss
+                    early_stop_counter = 0
+                    # save the model only when val loss decreases
+                    torch.save(self.diff_net.state_dict(), self.diff_model_saving_path)
+
+                else:
+                    early_stop_counter += 1
+
+                if early_stop_counter >= self.early_stop_patience:
+                    print(f"Early stopping triggered at epoch {epoch}, best loss is {best_loss}.")
+                    break
+                    
+        # train spatial layer
+        print("Starting training spatial layer")
+        each_layer_train_val(enable_motion = False, enable_control = False)
+        
+        # train motion layer
+        if self.diff_model == "wavenet_motion" or self.diff_model == "wavenet_motion_control":
+            print("Starting training motion layer")
+            # load best model from last training phase
+            ckpt = torch.load(self.diff_model_saving_path, map_location = self.device)
+            self.diff_net.load_state_dict(ckpt)
+            each_layer_train_val(enable_motion = True, enable_control = False)
             
-            
+            # this is for next control layer training
+            for name, param in net.named_parameters():
+                param.requires_grad = True 
+                    
+        # train control layer
+        if self.diff_model == "wavenet_control":
+            print("Starting training control layer")
+            # load best model from last training phase
+            ckpt = torch.load(self.diff_model_saving_path, map_location = self.device)
+            self.diff_net.load_state_dict(ckpt)
+            each_layer_train_val(enable_motion = False, enable_control = True)
+                    
+        # train control layer
+        if self.diff_model == "wavenet_motion_control":
+            print("Starting training control layer")
+            # load best model from last training phase
+            ckpt = torch.load(self.diff_model_saving_path, map_location = self.device)
+            self.diff_net.load_state_dict(ckpt)
+            each_layer_train_val(enable_motion = True, enable_control = True)
             
             

@@ -74,14 +74,17 @@ class Sampler():
         if self.diff_model == "s4":
             from nets.diff_s4 import diff_S4
             self.diff_net = diff_S4(input_dim = 2, cond_dim = 7)
-        if self.diff_model == "transformer":
-            from nets.transformer import TransformerDiffusionModel
-            self.diff_net = TransformerDiffusionModel()
-        if self.diff_model == "unet":
-            from nets.unet import CNNDiffusionModel
-            self.diff_net = CNNDiffusionModel()
         if self.diff_model == "wavenet":
-            from nets.diff_wavenet_joint import WaveNetJoint
+            from nets.diff_wavenet import WaveNetJoint
+            self.diff_net = WaveNetJoint(input_dim = 2, cond_dim = 7)
+        if self.diff_model == "wavenet_motion":
+            from nets.diff_wavenet_motion import WaveNetJoint
+            self.diff_net = WaveNetJoint(input_dim = 2, cond_dim = 7)
+        if self.diff_model == "wavenet_control":
+            from nets.diff_wavenet_control import WaveNetJoint
+            self.diff_net = WaveNetJoint(input_dim = 2, cond_dim = 7)
+        if self.diff_model == "wavenet_motion_control":
+            from nets.diff_wavenet_motion_control import WaveNetJoint
             self.diff_net = WaveNetJoint(input_dim = 2, cond_dim = 7)
             
         diff_ckpt = torch.load(self.diff_model_loading_path, map_location = self.device, weights_only = True)
@@ -112,8 +115,8 @@ class Sampler():
         effective_past_batch = None
         for idx, (past_batch, predict_batch, trend_batch, volatility_batch, liquidity_batch, oi_batch, _, predict_time_batch) in enumerate(loop):
             
-            # For every refresh_cycle = 4 sampling, the model uses real condition, otherelse the model takes pure autoregressive way.
-            refresh_cycle = 4
+            # For every refresh_cycle = 10 sampling, the model uses real condition, otherelse the model takes pure autoregressive way.
+            refresh_cycle = 10
             if self.AR:
                 if idx > 0:
                     is_reset_step = (idx % refresh_cycle == 0)
@@ -174,7 +177,17 @@ class Sampler():
             
             # single sampling
             # sampling_fn returns two tensors: x_mean and sde.N * (n_steps + 1)
-            samples = sampling_fn(self.diff_net, cond, self.guidance)[0]   # [batch_size, 2, 20, predict_window]
+            if self.diff_model == "wavenet":
+                samples = sampling_fn(self.diff_net, cond, self.guidance, enable_motion = False, enable_control = False)[0]   # [batch_size, 2, 20, predict_window]
+                
+            if self.diff_model == "wavenet_motion":
+                samples = sampling_fn(self.diff_net, cond, self.guidance, enable_motion = True, enable_control = False)[0]   # [batch_size, 2, 20, predict_window]
+                
+            if self.diff_model == "wavenet_control":
+                samples = sampling_fn(self.diff_net, cond, self.guidance, enable_motion = False, enable_control = True)[0]   # [batch_size, 2, 20, predict_window]
+                
+            if self.diff_model == "wavenet_motion_control":
+                samples = sampling_fn(self.diff_net, cond, self.guidance, enable_motion = True, enable_control = True)[0]   # [batch_size, 2, 20, predict_window]
             
             # price postprocess
             samples[:, 0:1, :, :] = samples[:, 0:1, :, :] / 100
