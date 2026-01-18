@@ -14,6 +14,7 @@ class Trainer():
         self.train_dataloader = train_dataloader
         self.val_dataloader = val_dataloader
         self.config = config
+        self.n_levels = config.n_levels
         self.n_epochs = config.n_epochs
         self.learning_rate = config.learning_rate
         self.diff_model = config.diff_model
@@ -28,6 +29,8 @@ class Trainer():
         self.continuous = config.continuous
         self.reduce_mean = config.reduce_mean
         self.likelihood_weighting = config.likelihood_weighting
+        self.control = config.control
+        self.motion = config.motion
         self.early_stop_patience = config.early_stop_patience
         self.early_stop_min_delta = config.early_stop_min_delta
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -47,27 +50,27 @@ class Trainer():
                                    likelihood_weighting = self.likelihood_weighting)
         
         
-    def _process_batch(self, past_batch, predict_batch, trend_batch, volatility_batch, liquidity_batch, oi_batch, past_time_batch, predict_time_batch):
+    def _process_batch(self, past_batch, predict_batch, trend_batch, volatility_batch, liquidity_batch, imb_batch, past_time_batch, predict_time_batch):
         
-        # both shape is [B, predict_window, 20, 2] if 'past_window - 1 == predict_window'
-        transformed_past_batch, transformed_predict_batch = transform_past_predict_batch(past_batch, predict_batch) 
-
-        # Build target tensor x of shape [B, 2, 20, predict_window]
+        # both shape is [B, predict_window, F, 2] if 'past_window - 1 == predict_window'
+        transformed_past_batch, transformed_predict_batch = transform_past_predict_batch(past_batch, predict_batch, self.n_levels) 
+        _, _, F, _ = transformed_past_batch.shape
+        
+        # ---------- target x : [B, 2, F, predict_window] ----------
 
         # price process
-        x_price = transformed_predict_batch[:, :, :, 0:1] # [B, predict_window, 20, 1]
+        x_price = transformed_predict_batch[:, :, :, 0:1] # [B, predict_window, F, 1]
         x_price = x_price * 100
         
         # volume process
         x_volume = transformed_predict_batch[:, :, :, -1:]
-        x_volume = torch.sqrt(x_volume) / 15 # [B, predict_window, 20, 1]
+        x_volume = torch.sqrt(x_volume) / 15 # [B, predict_window, F, 1]
         
         # concat price and volume
         x = torch.concat([x_price, x_volume], dim = -1).permute(0, 3, 2, 1)       
         x = x.to(self.device)
         
-        # Select condition
-        # Build each condition tensor of shape [B, 1, 20, predict_window]
+        # ---------- conditions cond : [B, 7, F, predict_window] ----------
         
         past_price_cond = transformed_past_batch[:, :, :, 0:1].permute(0, 3, 2, 1)
         past_price_cond = past_price_cond * 100
@@ -75,34 +78,31 @@ class Trainer():
         past_volume_cond = transformed_past_batch[:, :, :, -1:].permute(0, 3, 2, 1)
         past_volume_cond = torch.sqrt(past_volume_cond) / 15
         
-        trend_cond = trend_batch.unsqueeze(1).unsqueeze(2).unsqueeze(3).expand(-1, 1, 20, self.predict_window)
+        trend_cond = trend_batch
         # trend_cond = torch.clamp(trend_cond, min = -0.1, max = 0.1)
-        trend_cond = torch.where(trend_cond >= 0, torch.sqrt(trend_cond), -torch.sqrt(-trend_cond))
+        trend_cond = torch.where(trend_cond >= 0, torch.sqrt(trend_cond), -torch.sqrt(-trend_cond)) * 10 # what if we use multiplication of 100?
         
-        volatility_cond = volatility_batch.unsqueeze(1).unsqueeze(2).unsqueeze(3).expand(-1, 1, 20, self.predict_window)
-        # volatility_cond = torch.clamp(volatility_cond, max = 0.01)
-        volatility_cond = torch.sqrt(volatility_cond)
+        volatility_cond = volatility_batch
+        # volatility_cond = torch.clamp(volatility_cond, max = 0.1)
+        volatility_cond = torch.sqrt(volatility_cond) * 10
         
-        liquidity_cond = liquidity_batch / 20
-        liquidity_cond = liquidity_cond.unsqueeze(1).unsqueeze(2).expand(-1, 1, 20, self.predict_window)
+        liquidity_cond = liquidity_batch / 2
+        liquidity_cond = liquidity_cond
         liquidity_cond = torch.sqrt(liquidity_cond) / 15
         
-        oi_cond = oi_batch.unsqueeze(1).unsqueeze(2).expand(-1, 1, 20, self.predict_window)
+        imb_cond = imb_batch
 
-        time_cond = predict_time_batch.unsqueeze(1).unsqueeze(2).expand(-1, 1, 20, self.predict_window)
+        time_cond = predict_time_batch
 
-        # concat all contions
-        assert (past_price_cond.shape[1] == past_volume_cond.shape[1] == trend_cond.shape[1] == volatility_cond.shape[1] == liquidity_cond.shape[1] == oi_cond.shape[1] == time_cond.shape[1]), "Past condition length does not match prediction length."
-        cond = torch.cat([past_price_cond, past_volume_cond, trend_cond, volatility_cond, liquidity_cond, oi_cond, time_cond], dim = 1)
-
-        cond = cond.to(self.device)
+        cond = (past_price_cond.to(self.device), past_volume_cond.to(self.device), 
+                trend_cond.to(self.device), volatility_cond.to(self.device), 
+                liquidity_cond.to(self.device), imb_cond.to(self.device), 
+                time_cond.to(self.device))
         
         # Classifier-free guidance dropout
         if torch.rand(1).item() < self.drop_probability:
-            cond = torch.zeros_like(cond)
+            cond = tuple(torch.zeros_like(item) for item in cond)
         
-        # x.shape = [batch_size, 2, 20, predict_window]
-        # cond.shape = [batch_size, 7, 20, predict_window]
         return x, cond
     
 
@@ -117,8 +117,8 @@ class Trainer():
         total_items = 0
         scaler = torch.amp.GradScaler()
 
-        for past_batch, predict_batch, trend_batch, volatility_batch, liquidity_batch, oi_batch, past_time_batch, predict_time_batch in dataloader:
-            x, cond = self._process_batch(past_batch, predict_batch, trend_batch, volatility_batch, liquidity_batch, oi_batch, past_time_batch, predict_time_batch)
+        for past_batch, predict_batch, trend_batch, volatility_batch, liquidity_batch, imb_batch, past_time_batch, predict_time_batch in dataloader:
+            x, cond = self._process_batch(past_batch, predict_batch, trend_batch, volatility_batch, liquidity_batch, imb_batch, past_time_batch, predict_time_batch)
 
             if training:    
                 self.optimizer.zero_grad()
@@ -127,13 +127,14 @@ class Trainer():
                     
                 # skip batch that would elicit nan loss
                 if torch.isnan(loss) or torch.isinf(loss):
+                    self.optimizer.zero_grad()
                     continue
                     
                 scaler.scale(loss).backward()
                 
                 if self.clip_gradient is not None:
                     nn.utils.clip_grad_norm_(net.parameters(), self.clip_gradient)
-                
+                                    
                 scaler.step(self.optimizer)
                 scaler.update()
             
@@ -158,37 +159,41 @@ class Trainer():
             self.diff_net = diff_S4(input_dim = 2, cond_dim = 7)
         if self.diff_model == "wavenet":
             from nets.diff_wavenet import WaveNetJoint
-            self.diff_net = WaveNetJoint(input_dim = 2, cond_dim = 7)
+            self.diff_net = WaveNetJoint(input_dim = 2)
         if self.diff_model == "wavenet_motion":
             from nets.diff_wavenet_motion import WaveNetJoint
-            self.diff_net = WaveNetJoint(input_dim = 2, cond_dim = 7)
+            self.diff_net = WaveNetJoint(input_dim = 2)
         if self.diff_model == "wavenet_control":
             from nets.diff_wavenet_control import WaveNetJoint
-            self.diff_net = WaveNetJoint(input_dim = 2, cond_dim = 7)
+            self.diff_net = WaveNetJoint(input_dim = 2)
         if self.diff_model == "wavenet_motion_control":
             from nets.diff_wavenet_motion_control import WaveNetJoint
-            self.diff_net = WaveNetJoint(input_dim = 2, cond_dim = 7)
+            self.diff_net = WaveNetJoint(input_dim = 2)
         
         self.diff_net.to(self.device)
         net = self.diff_net
                     
         def each_layer_train_val(enable_motion, enable_control):
-            # determine which parameters should be freezed
-            if enable_motion == True and enable_control == False:
-                for name, param in net.named_parameters():
-                    if "motion_module" not in name:
-                        param.requires_grad = False
-            elif enable_motion == False and enable_control == True:
-                for name, param in net.named_parameters():
-                    if "control_blocks" not in name:
-                        param.requires_grad = False
-            elif enable_motion == True and enable_control == True:
+            for param in net.parameters():
+                param.requires_grad = True
+
+            if enable_control == True and enable_motion == False:
+                # When solely training control: freeze all except control blocks
                 for name, param in net.named_parameters():
                     if "control_blocks" not in name:
-                        param.requires_grad = False  
-            else:
-                for param in net.parameters():
-                    param.requires_grad = True 
+                        param.requires_grad = False
+            
+            if enable_control == False and enable_motion == True:
+                # When solely training motion: freeze all except control blocks
+                for name, param in net.named_parameters():
+                    if "motion_blocks" not in name:
+                        param.requires_grad = False
+                        
+            if enable_control == True and enable_motion == True:
+                # When training control and motion: freeze all except control and motion blocks
+                for name, param in net.named_parameters():
+                    if "control_blocks" not in name and "motion_blocks" not in name:
+                        param.requires_grad = False
         
             best_loss = float('inf')
             early_stop_counter = 0
@@ -220,32 +225,33 @@ class Trainer():
         print("Starting training spatial layer")
         each_layer_train_val(enable_motion = False, enable_control = False)
         
-        # train motion layer
-        if self.diff_model == "wavenet_motion" or self.diff_model == "wavenet_motion_control":
+        if self.control == True and self.motion == False:
+            print("Starting training control layer")
+            # load best model from last training phase
+            ckpt = torch.load(self.diff_model_saving_path, map_location = self.device)
+            self.diff_net.load_state_dict(ckpt)
+            each_layer_train_val(enable_motion = False, enable_control = True)
+            
+        if self.control == False and self.motion == True:
+            print("Starting training motion layer")
+            # load best model from last training phase
+            ckpt = torch.load(self.diff_model_saving_path, map_location = self.device)
+            self.diff_net.load_state_dict(ckpt)
+            each_layer_train_val(enable_motion = True, enable_control = False)        
+        
+        if self.control == True and self.motion == True:
             print("Starting training motion layer")
             # load best model from last training phase
             ckpt = torch.load(self.diff_model_saving_path, map_location = self.device)
             self.diff_net.load_state_dict(ckpt)
             each_layer_train_val(enable_motion = True, enable_control = False)
             
-            # this is for next control layer training
-            for name, param in net.named_parameters():
-                param.requires_grad = True 
-                    
-        # train control layer
-        if self.diff_model == "wavenet_control":
             print("Starting training control layer")
             # load best model from last training phase
             ckpt = torch.load(self.diff_model_saving_path, map_location = self.device)
             self.diff_net.load_state_dict(ckpt)
             each_layer_train_val(enable_motion = False, enable_control = True)
-                    
-        # train control layer
-        if self.diff_model == "wavenet_motion_control":
-            print("Starting training control layer")
-            # load best model from last training phase
-            ckpt = torch.load(self.diff_model_saving_path, map_location = self.device)
-            self.diff_net.load_state_dict(ckpt)
-            each_layer_train_val(enable_motion = True, enable_control = True)
+            
+
             
             

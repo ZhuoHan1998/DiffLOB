@@ -24,16 +24,6 @@ import opt_einsum as oe
 contract = oe.contract
 contract_expression = oe.contract_expression
 
-
-
-''' Standalone CSDI + S4 imputer for random missing, non-random missing and black-out missing.
-The notebook contains CSDI and S4 functions and utilities. However the imputer is located in the last Class of
-the notebook, please see more documentation of use there. Additional at this file can be added for CUDA multiplication 
-the cauchy kernel.'''
-
-
-
-
 def get_logger(name=__name__, level=logging.INFO) -> logging.Logger:
     """Initializes multi-GPU-friendly python logger."""
 
@@ -1430,12 +1420,12 @@ class diff_S4(nn.Module):
         input_dim: int,
         cond_dim: int,
         
-        res_channels = 256,
-        skip_channels = 256,
-        num_res_layers = 36,
+        res_channels = 128,
+        skip_channels = 128,
+        num_res_layers = 8,
         diffusion_step_embed_dim_in = 128,
-        diffusion_step_embed_dim_mid = 512,
-        diffusion_step_embed_dim_out = 512,
+        diffusion_step_embed_dim_mid = 128,
+        diffusion_step_embed_dim_out = 128,
         s4_lmax = 100,
         s4_d_state = 64,
         s4_dropout = 0.0,
@@ -1478,35 +1468,75 @@ class diff_S4(nn.Module):
         # output: [B, skip_channels, T] -> [B, in_channels_flat, T]
         self.out_proj = nn.Conv1d(skip_channels, in_channels_flat, kernel_size=1)
 
-    def forward(self, x, diffusion_steps, cond):
+    def _pack_cond_tuple_to_tensor(self, cond_tuple, F: int, T: int, device):
+        (past_price, past_vol, trend, vol, liq, imb, time) = cond_tuple
+
+        # past maps already [B,1,F,T]
+        past_price = past_price.to(device)
+        past_vol   = past_vol.to(device)
+
+        # trend/vol: [B] or [B,1] -> [B,1,F,T]
+        if trend.dim() == 1:
+            trend = trend[:, None]  # [B,1]
+        if vol.dim() == 1:
+            vol = vol[:, None]      # [B,1]
+        trend = trend.to(device).view(-1, 1, 1, 1).expand(-1, 1, F, T)
+        vol   = vol.to(device).view(-1, 1, 1, 1).expand(-1, 1, F, T)
+
+        # liquidity/imb/time: [B,T] -> [B,1,F,T]
+        def _seq_to_map(x):
+            # x: [B,T] or [B,1,T]
+            if x.dim() == 3:
+                x = x.squeeze(1)
+            x = x.to(device).view(-1, 1, 1, T).expand(-1, 1, F, T)
+            return x
+
+        liq  = _seq_to_map(liq)
+        imb  = _seq_to_map(imb)
+        time = _seq_to_map(time)
+
+        cond = torch.cat([past_price, past_vol, trend, vol, liq, imb, time], dim=1)  # [B,7,F,T]
+        return cond
+
+
+    def forward(self, x, t, cond, enable_motion: bool = False, enable_control: bool = False):
         """
+        Match diffusion_trainer.py expected calling convention:
+          net(x, t, cond, enable_motion, enable_control)
         Args:
             x:    [B, input_dim, 20, T]
-            cond: [B, cond_dim, 20, T]
-            diffusion_steps: [B,]
-        Returns:
-            out:  [B, input_dim, 20, T]
+            t:    [B] or [B,1] diffusion steps
+            cond: tuple of 7 tensors (from Trainer) OR a packed tensor [B,7,20,T]
         """
-        B, Cx, K, T = x.shape
-        assert K == self.levels, f"Expected levels=20, got {K}"
+        # --- normalize t shape: [B] ---
+        if t.dim() == 2 and t.size(-1) == 1:
+            t = t.squeeze(-1)
+        t = t.long()
+
+        B, Cx, K, T_ = x.shape
+        assert K == self.levels, f"Expected levels={self.levels}, got {K}"
+
+        # --- pack cond if it's a tuple ---
+        if isinstance(cond, (tuple, list)):
+            cond = self._pack_cond_tuple_to_tensor(cond, F=K, T=T_, device=x.device)
+        else:
+            cond = cond.to(x.device)
+
+        # cond should be [B, cond_dim(=7), 20, T]
         Bc, Cc, Kc, Tc = cond.shape
-        assert Bc == B and Kc == K and Tc == T, "cond must match x in batch/levels/time"
+        assert (Bc == B) and (Kc == K) and (Tc == T_), "cond must match x in batch/levels/time"
 
         # Flatten the level dimension into channels -> [B, C_flat, T]
-        x_flat = x.reshape(B, Cx * K, T)
-        cond_flat = cond.reshape(B, Cc * K, T)
+        x_flat = x.reshape(B, Cx * K, T_)
+        cond_flat = cond.reshape(B, Cc * K, T_)
 
         # Map input to residual channels
-        h = self.in_proj(x_flat)                     # [B, res_channels, T]
+        h = self.in_proj(x_flat)  # [B, res_channels, T]
 
-        # Residual_group expects: noise=[B, res_channels, T], conditional=[B, 2*in_channels_rg, T]
-        # We have ensured 2*in_channels_rg == cond_flat.shape[1]
-        skip = self.group((h, cond_flat, diffusion_steps))    # [B, skip_channels, T]
+        # Residual_group expects (noise, conditional, diffusion_steps)
+        skip = self.group((h, cond_flat, t))  # [B, skip_channels, T]
 
-        # Map skip output back to input_dim*20
-        out_flat = self.out_proj(skip)               # [B, input_dim*20, T]
-
-        # Reshape back to [B, input_dim, 20, T]
-        out = out_flat.view(B, Cx, K, T)
+        out_flat = self.out_proj(skip)        # [B, input_dim*20, T]
+        out = out_flat.view(B, Cx, K, T_)     # [B, input_dim, 20, T]
         return out
 

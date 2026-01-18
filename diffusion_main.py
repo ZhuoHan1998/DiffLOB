@@ -6,7 +6,7 @@ import importlib.util
 import torch
 
 from utils.util import load_config, convert_dataframe_to_tensor, compute_time_deltas, get_dataloader
-from utils.preprossing import process_folder
+from utils.preprocessing import process_folder
 from diffusion_trainer import Trainer
 from diffusion_sampler import Sampler
 
@@ -36,12 +36,12 @@ if __name__ == "__main__":
     train_orderbooks = pd.concat(train_orderbooks, ignore_index = True)
     val_orderbooks = pd.concat(val_orderbooks, ignore_index = True)
     test_orderbooks = pd.concat(test_orderbooks, ignore_index = True)
-    print(f"train orderbooks: {train_orderbooks.head()}",
-          f"train orderbooks shape: {train_orderbooks.shape}")
-    print(f"val orderbooks: {val_orderbooks.head()}",
-          f"val orderbooks shape: {val_orderbooks.shape}")
-    print(f"test orderbooks: {test_orderbooks.head()}",
-          f"test orderbooks shape: {test_orderbooks.shape}")
+    # print(f"train orderbooks: {train_orderbooks.head()}",
+    #       f"train orderbooks shape: {train_orderbooks.shape}")
+    # print(f"val orderbooks: {val_orderbooks.head()}",
+    #       f"val orderbooks shape: {val_orderbooks.shape}")
+    # print(f"test orderbooks: {test_orderbooks.head()}",
+    #       f"test orderbooks shape: {test_orderbooks.shape}")
 
     train_orderbooks_tensor = convert_dataframe_to_tensor(train_orderbooks)
     val_orderbooks_tensor = convert_dataframe_to_tensor(val_orderbooks)

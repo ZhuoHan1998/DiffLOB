@@ -216,8 +216,25 @@ class AncestralSamplingPredictor(Predictor):
         sde = self.sde
         timestep = (t * (sde.N - 1) / sde.T).long()
         beta = sde.discrete_betas.to(t.device)[timestep]
-        score = guidance * self.score_fn(x, t, cond, enable_motion, enable_control) + (1 - guidance) * self.score_fn(x, t, torch.zeros_like(cond), enable_motion, enable_control)
+        cond_zero = tuple(torch.zeros_like(c) for c in cond)
+        score = guidance * self.score_fn(x, t, cond, enable_motion, enable_control) + (1 - guidance) * self.score_fn(x, t, cond_zero, enable_motion, enable_control)
         x_mean = (x + beta[:, None, None, None] * score) / torch.sqrt(1. - beta)[:, None, None, None]
+        
+        # post control on trend and vol
+        # if t.item() < 0.2:
+        #     with torch.enable_grad():
+        #         x_mean_copy = x_mean.detach().requires_grad_(True)
+        #         r_hat = x_mean_copy[:, 0, 0, :]
+        #         trend_hat, vol_hat = r_hat.sum(), r_hat.std()
+        #         trend, vol = cond[2], cond[3]
+        #         trend_w, vol_w = 0.04, 0.0
+        #         stat_scale = 1
+        #         loss_trend = trend_w * (trend_hat - trend) ** 2
+        #         loss_vol = vol_w * (vol_hat - vol) ** 2
+        #         loss_stat = loss_trend + loss_vol
+        #         grad_x = torch.autograd.grad(loss_stat, x_mean_copy, retain_graph = False, create_graph = False)[0]
+        #         x_mean = x_mean - stat_scale * grad_x.detach()
+
         noise = torch.randn_like(x)
         x = x_mean + torch.sqrt(beta)[:, None, None, None] * noise
         return x, x_mean
