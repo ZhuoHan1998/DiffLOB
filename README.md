@@ -8,7 +8,7 @@ DiffLOB explicitly conditions the generative process on future market regimes—
 
 
 <p align="center">
-  <img src="pics/DiffLOB Acchitecture.png" width="700">
+  <img src="pics/DiffLOB_Architecture.png" width="700">
 </p>
 
 <p align="center">
