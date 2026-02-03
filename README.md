@@ -31,6 +31,13 @@ DiffLOB addresses this limitation by:
 - Joint modeling of **price and volume dynamics**
 - Extensive evaluation on realism, counterfactual validity, and downstream usefulness
 
+## ▶️ Running Training and Sampling Scripts
+
+All training and sampling procedures are managed through scripts in the `scripts/` directory. Run:
+
+```bash
+bash scripts/train.sh
+
 
 <p align="center">
   <img src="pics/DiffLOB_Architecture.png" width="700">
