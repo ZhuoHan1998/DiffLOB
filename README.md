@@ -36,8 +36,8 @@ DiffLOB addresses this limitation by:
 All training and sampling procedures are managed through scripts in the `scripts/` directory. Run:
 
 ```bash
-bash scripts/train.sh
-
+bash scripts/AAPL/diff_wavenet_motion_control.sh
+```
 
 <p align="center">
   <img src="pics/DiffLOB_Architecture.png" width="700">
