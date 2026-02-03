@@ -55,7 +55,7 @@ python build_conds.py
 All training and sampling procedures are managed through scripts in the `scripts/` directory. Run:
 
 ```bash
-bash scripts/AAPL/diff_wavenet_motion_control.sh
+bash scripts/AMZN/diff_wavenet_motion_control.sh
 ```
 
 ---
