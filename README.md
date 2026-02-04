@@ -83,7 +83,7 @@ If you find this repository useful for your research, please consider citing our
 @article{wang2025difflob,
   title     = {DiffLOB: Diffusion Models for Counterfactual Generation in Limit Order Books},
   author    = {Wang, Zhuohan and Ventre, Carmine},
-  journal   = {arXiv preprint},
+  journal   = {arXiv:2602.03776},
   year      = {2026}
 }
 ```
