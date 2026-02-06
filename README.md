@@ -73,17 +73,3 @@ Unless otherwise specified, figures are shown on **AMZN**.
 <p align="center">
   <img src="pics/volume_heatmaps_AMZN.png" width="700">
 </p>
-
-
-## 📚 Citation
-
-If you find this repository useful for your research, please consider citing our paper:
-
-```bibtex
-@article{wang2025difflob,
-  title     = {DiffLOB: Diffusion Models for Counterfactual Generation in Limit Order Books},
-  author    = {Wang, Zhuohan and Ventre, Carmine},
-  journal   = {arXiv:2602.03776},
-  year      = {2026}
-}
-```
