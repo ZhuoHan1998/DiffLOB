@@ -41,7 +41,7 @@ Model architecture is shown by following graph:
 
 ## 🧠 Building Conditioning Variables
 
-DiffLOB requires future market regime conditions to be precomputed before training and sampling.
+DiffLOB requires future market regime conditions to be precomputed before counterfactual sampling.
 These conditioning variables are constructed using the script:
 
 ```bash
